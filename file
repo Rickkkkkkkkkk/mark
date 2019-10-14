@@ -1,1 +1,2 @@
-
+1.建议：jedisPool中的最大连接数jedis比默认值8大一些即可，当没有jedis可获取时，默认会阻塞，可设置config.setBlockWhenExhausted(false);，则会抛出异常。
+2.jedis连接时间默认为10秒，超过10秒还连接未成功会抛JedisConnectException，可通过jedisPool.getResource().getClient().setConnectionTimeout(connectionTimeout)设置连接时间。
