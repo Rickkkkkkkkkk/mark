@@ -142,8 +142,8 @@ public class RedisDistributedLock {
 
 		Jedis jedis = redisClient.getJedis();
 		try {
-			LockSupport.unpark(QUEUE.poll());
 			jedis.eval(SCRIPT, Collections.singletonList(key), Collections.singletonList(value));
+			LockSupport.unpark(QUEUE.poll());
 		} finally {
 			jedis.close();
 		}
