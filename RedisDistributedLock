@@ -1,0 +1,191 @@
+package com.sinolife.lem.pub.util;
+
+import java.util.Collections;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
+
+import org.springframework.stereotype.Component;
+
+import redis.clients.jedis.Jedis;
+
+/**
+ * redis实现的分布式锁
+ * 
+ * @author zhongzhibin.wb
+ *
+ */
+@Component
+public class RedisDistributedLock {
+
+	@SuppressWarnings("static-access")
+	public RedisDistributedLock(RedisClient redisClient) {
+		this.redisClient = redisClient;
+	}
+
+	/**
+	 * 原子释放锁脚本
+	 */
+	private static final String SCRIPT = "if redis.call('get', KEYS[1]) == ARGV[1] then "
+			+ "return redis.call('del', KEYS[1]) else return 0 end";
+
+	/**
+	 * 原子增加锁时间
+	 */
+	private static final String SCRIPT_TTL = "local a = redis.call('pttl', KEYS[1]) " + "if a > 0 "
+			+ "then return redis.call('pexpire', KEYS[1], ARGV[1] + a) else return 0 end";
+
+	/**
+	 * 尝试获取锁，获得返回true，反之返回false
+	 * 
+	 * @param key
+	 * @param value
+	 * @param expireTime
+	 *            过期时间，单位为秒，值必须大于0
+	 * @return
+	 */
+	public static boolean tryLock(String key, String value, int expireTime) {
+		if (expireTime < 0) {
+			throw new IllegalArgumentException("the parameter of expireTime must be greater than 0");
+		}
+
+		Jedis jedis = redisClient.getJedis();
+		Thread current = Thread.currentThread();
+		try {
+			String result = jedis.set(key, value, "nx", "ex", expireTime);
+			if (LOCK_SUCCESS.equals(result)) {
+				count = 1;
+				setExclusiveOwnerThread(current);
+				return true;
+			}
+
+			if (current == getExclusiveOwnerThread()) {
+				count++;
+				Object object = jedis.eval(SCRIPT_TTL, Collections.singletonList(key),
+						Collections.singletonList(TimeUnit.SECONDS.toMillis(expireTime) + ""));
+				return 1 == (long) object;
+			}
+		} finally {
+			jedis.close();
+		}
+
+		return false;
+	}
+
+	/**
+	 * 尝试在指定时间内获取锁，若获得锁返回ture，否则返回false
+	 * 
+	 * @param key
+	 * @param value
+	 * @param expireTime
+	 *            key过期时间
+	 * @param timeout
+	 *            等待锁时间
+	 * @param unit
+	 *            等待锁时间的单位
+	 * @return
+	 * @throws InterruptedException
+	 */
+	public static boolean tryLockWithTimeout(String key, String value, int expireTime, long timeout, TimeUnit unit)
+			throws InterruptedException {
+		if (tryLock(key, value, expireTime)) {
+			return true;
+		}
+
+		long nanosTimeout = unit.toNanos(timeout);
+		long lastTime = System.nanoTime();
+		boolean failed = true;
+		try {
+			for (;;) {
+				if (tryLock(key, value, expireTime)) {
+					failed = false;
+					return true;
+				}
+				if (nanosTimeout <= 0) {
+					return false;
+				}
+
+				if (nanosTimeout > spinForTimeoutThreshold) {
+					QUEUE.add(Thread.currentThread());
+					LockSupport.parkNanos(nanosTimeout);
+				}
+
+				long now = System.nanoTime();
+				nanosTimeout -= now - lastTime;
+				lastTime = now;
+			}
+		} finally {
+			if (failed) {
+				if (!QUEUE.remove(Thread.currentThread())) {
+					LockSupport.unpark(QUEUE.poll());
+				}
+			}
+		}
+
+	}
+
+	/**
+	 * 释放锁
+	 * 
+	 * @param key
+	 * @param value
+	 *            跟获取锁时设置的value一直才能释放锁
+	 */
+	public static void unlock(String key, String value) {
+		if (Thread.currentThread() != getExclusiveOwnerThread()) {
+			throw new IllegalMonitorStateException();
+		}
+
+		if (--count > 0) {
+			return;
+		}
+
+		Jedis jedis = redisClient.getJedis();
+		try {
+			LockSupport.unpark(QUEUE.poll());
+			jedis.eval(SCRIPT, Collections.singletonList(key), Collections.singletonList(value));
+		} finally {
+			jedis.close();
+		}
+
+	}
+
+	private static final String LOCK_SUCCESS = "OK";
+
+	private static RedisClient redisClient;
+
+	private static final long spinForTimeoutThreshold = 1000L;
+
+	// 线程重入数
+	private static int count;
+
+	/**
+	 * The current owner of exclusive mode synchronization.
+	 */
+	private static transient Thread exclusiveOwnerThread;
+
+	private static final ConcurrentLinkedQueue<Thread> QUEUE = new ConcurrentLinkedQueue<>();
+
+	/**
+	 * Sets the thread that currently owns exclusive access. A {@code null}
+	 * argument indicates that no thread owns access. This method does not
+	 * otherwise impose any synchronization or {@code volatile} field accesses.
+	 * 
+	 * @param thread
+	 *            the owner thread
+	 */
+	private static final void setExclusiveOwnerThread(Thread thread) {
+		exclusiveOwnerThread = thread;
+	}
+
+	/**
+	 * Returns the thread last set by {@code setExclusiveOwnerThread}, or
+	 * {@code null} if never set. This method does not otherwise impose any
+	 * synchronization or {@code volatile} field accesses.
+	 * 
+	 * @return the owner thread
+	 */
+	private static final Thread getExclusiveOwnerThread() {
+		return exclusiveOwnerThread;
+	}
+}
