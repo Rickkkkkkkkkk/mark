@@ -1,0 +1,70 @@
+redis是一个内存型数据库并可持久化到硬盘。
+key-value数据模型，但是value的类型有多种：Strings, Lists, Sets, Sorted Sets, Hashes, Streams, HyperLogLogs, Bitmaps，geospatial indexes 
+
+key：
+	最大为512M
+	用分号分隔："comment:1234:reply.to" or "comment:1234:reply-to" 多个单词用.或-分隔
+string类型value最大为512M
+
+
+
+
+
+复制：当主节点发送写操作更改数据后，会定期发送命令到从节点以保持从节点跟主节点数据的一致性。
+	  当从节点和主节点连接断开时（网络或主从节点检测到超时），从节点会重连并发起部分数据（断开连接后丢失的命令）重新同步。
+	  当不能部分同步时（replication id不一致或者请求数据不在backlog中），会请求完整数据同步。主节点会对其数据生成一个快照（RDB）发送给从节点，然后继续发送一连串命令（新变更）。
+	  主节点通过异步定期发送命令给从节点，从节点也异步地发送确认（处理的数据量）给主节点。
+	  在主节点可以通过wait命令阻塞操作并等待从节点处理好命令，能降低主从之间数据的延迟。
+	  一个主节点可以有多个从节点，每个从节点又可以有多个从节点。redis4.0开始，无论直接还是间接从节点，都会从主节点收到一样的数据。
+	  从节点执行完整同步后，旧数据会被删掉然后加载新的数据集。redis4.0后，可以（配置）使用另外一个线程来删除数据，但是加载数据还是会使用主线程，仍然会阻塞当前从节点。
+	  从节点的好处是：多个从节点提供只读以降低主节点负载，并且可以通过多个副本以实现高可用和数据安全。
+	  可以关闭主节点的持久化，并开启丛节点持久化，提高主节点相应性能，但是需要小心避免主节点宕机后自动重启，导致从节点发起复制请求后，把从节点数据也删掉。
+
+	  (Replication ID, offset)准确确定一个数据的版本，同步时，从节点会发送这个组合给主节点，从而获取新增的部分数据。
+	  
+	  
+	配置复制的三种方式（redis5.0后使用REPLICAOF host port）：
+		1.在配置文件中加入slaveof {masterHost} {masterPort}
+		2.启动redis-server时加入启动命令--slaveof {masterHost} {masterPort}
+		3.直接使用命令slaveof {masterHost} {masterPort}
+	
+	断开复制：slaveof no one
+	
+	切换主节点：slaveof {otherMasterHost} {otherMasterPort}
+		
+	info replication可以看到复制相关信息：
+		lag：表示与从节点最后一次通信延迟的秒数
+		master_repl_offset：主节点写命令累计字节长度
+		repl_backlog_active:1		是否开启复制缓存区
+		repl_backlog_size:1048576	
+		repl_backlog_first_byte_offset:371311787802
+		repl_backlog_histlen:1048576
+
+	
+	安全性：当主节点配置requirepass参数进行密码验证时，从节点需要配置masterauth参数为requirepass值
+	
+	从节点默认使用slave-read-only=yes配置为只读模式，因为从节点修改的数据，主节点无法感知
+	
+	传输延迟：
+		repl-disable-tcp-nodelay：no 默认关闭
+		当关闭时，主节点的数据无论大小会及时通知从节点，主从之间延迟比较小，但是增加网络带宽。适用主从之间网络环境良好的场景，如同机房或同机架部署。
+		当开启时，主节点会合并较小的TCP数据包从而节省带宽。默认发送时间间隔取决于Linux的内核，一般默认为40毫秒。
+		--这种配置节省了带宽但增大主从之间的延迟。适用于主从网络环境复杂或带宽紧张的场景，如跨机房部署。
+		
+	拓扑：①一主一从②一主多从③树状主从结构
+	优化：如果主节点写命令并发量比较大时，主节点关闭持久化，可在从节点开启aof持久化。
+		  --当主节点宕机时，需在从节点执行slaveof no one，否则当主节点重启时，从节点会被清空
+		  
+		  一主多从需要考虑复制带来的主节点性能下降和占用大量带宽问题
+		
+		
+	重启但不想改变redis运行id（40位16进制字符串，info server可以看到run_id）：
+		redis-cli debug reload：会阻塞当前redis节点主线程，阻塞期间会生成本地RDB快照并清空数据，之后再加载RDB文件。
+		
+	psync命令：psync {runId} {offset}	runId：主节点运行id  offset：当前从节点已复制的数据偏移量，第一次参与复制则默认值为-1
+		从节点s会用psync命令完成部分复制和全量辅助功能。
+		主节点回复：+FULLRESYNC将触发全量复制
+					+CONTINUE将触发部分复制
+					+ERR：无法识别psync命令
+		
+		
